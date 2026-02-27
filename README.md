@@ -1,131 +1,123 @@
-# ConditionAlarm — Event-Driven Alarm System
+# dmcp
 
-An Android alarm app that triggers not on time, but on **conditions** — real-world events pulled from APIs. "Remind me when it stops raining", "Alert me when headlines mention a product launch", "Notify me when temperature drops below 10°C."
+**MCP Manager** — a modular, system- and user-level manager for MCP (Model Context Protocol) servers.
 
----
+## What it does
 
-## Table of Contents
+dmcp discovers, manages, and invokes MCP servers installed on your system. It works at two scopes:
 
-- [Overview](#overview)
-- [Tech Stack](#tech-stack)
-- [Project Structure](#project-structure)
-- [Getting Started](#getting-started)
-- [Documentation](#documentation)
-- [MVP Scope](#mvp-scope)
+- **User scope** — per-user, no root required (`~/.local/share/mcp/`, `~/.config/mcp/`)
+- **System scope** — system-wide, visible to all users (`/usr/share/mcp/`, `/etc/mcp/`)
 
----
+It supports both **local** (stdio) and **remote** (SSE, WebSocket) servers. Local servers are cloned and run from disk; remote servers are metadata-only, with connection endpoints stored in manifests.
 
-## Overview
+## Features
 
-The user creates a **Reminder** with one or more **Conditions**. Conditions are built from API data using a field, an operator, and a value (e.g. `weather.main == "Clear"`). Conditions can be composed with AND / OR logic into a tree. A background service polls the APIs on a schedule and fires a notification — TTS voice output or phone ringing — when all conditions evaluate to true.
+- **Discovery** — List installed servers (user + system)
+- **Registry** — Browse servers from configurable registry URLs
+- **Install** — Install from registry (by ID) or from URL (manifest/endpoint)
+- **Connect** — Add remote servers by URL (fetches manifest if valid JSON, else treats as raw endpoint)
+- **Config** — Get and set per-server configuration (API keys, endpoints, etc.)
+- **Invocation** — Spawn stdio servers; SSE/WebSocket: print connection URL
+- **Setup** — Run setup scripts at install (dependencies, config) or via `dmcp setup <id>`
 
-Users can build conditions **manually** by selecting an API from a dropdown, filling in fields via that API's own UI, or via **AI** by describing the condition in natural language.
+## Configuration
 
----
+Paths are configurable via environment variables. Copy `.env.example` to `.env` and adjust as needed:
 
-## Tech Stack
+```bash
+cp .env.example .env
+```
 
-| Layer | Technology |
-|---|---|
-| UI | Jetpack Compose |
-| Async | Coroutines + Flow |
-| Local DB | Room |
-| JSON | Moshi (with polymorphic adapters) |
-| Preferences | DataStore |
-| HTTP | Ktor Client |
-| IDE | Android Studio |
-| Language | Kotlin |
-| DI | Hilt |
+See [MCP-SYSTEM-SPEC.md](MCP-SYSTEM-SPEC.md) for the full specification and [MCP-REGISTRY-GUIDE.md](MCP-REGISTRY-GUIDE.md) for registry format and install flow.
 
----
+## Build & Run
+
+Requires [Rust](https://rustup.rs/).
+
+```bash
+cargo build --release
+cargo install --path .   # Install to ~/.cargo/bin
+```
+
+## Commands
+
+| Command | Description |
+|---------|-------------|
+| `dmcp list [--user] [--system] [--json]` | List installed MCP servers (default: both) |
+| `dmcp info <id> [--json]` | Show detailed info for a server |
+| `dmcp config <id> get [key] [--json]` | Get config value(s) |
+| `dmcp config <id> set <key> <value>` | Set a config value (uses pkexec for system scope) |
+| `dmcp sources list [--user] [--system]` | List registry source URLs |
+| `dmcp sources add <url> [--system]` | Add a registry source (default: user) |
+| `dmcp sources remove <url> [--system]` | Remove a registry source |
+| `dmcp browse [url] [--user] [--system] [-k keyword...] [--json]` | Browse servers in registries (filter by keyword; transport fetched from manifest when registry omits it) |
+| `dmcp install <id or url> [--system] [--no-setup]` | Install from registry (by ID) or from manifest/endpoint URL |
+| `dmcp uninstall <id>` | Remove installed server |
+| `dmcp run <id> [--verbose]` | Run server (stdio: spawn; SSE/WebSocket: print URL) |
+| `dmcp tools <id> [--json]` | List tools on a server |
+| `dmcp call <id> <tool> [--args JSON]` | Call a tool on a server |
+| `dmcp serve` | Run dmcp as MCP server (for LLM integration) |
+| `dmcp setup <id>` | Run setup script for an installed server |
+| `dmcp connect <url> [--id] [--name] [--summary] [--version] [-c key=value...] [--system] [--no-setup]` | Connect to remote server |
+| `dmcp paths` | Show resolved paths (debug) |
 
 ## Project Structure
 
 ```
-app/
-├── src/main/
-│   ├── java/com/conditionalarm/
-│   │   ├── data/
-│   │   │   ├── db/               # Room database, DAOs, entities
-│   │   │   ├── datastore/        # DataStore preferences
-│   │   │   └── repository/       # ReminderRepository
-│   │   ├── domain/
-│   │   │   ├── model/            # Reminder, Condition, LeafCondition, CompositeCondition
-│   │   │   └── evaluation/       # Condition tree evaluation logic
-│   │   ├── api/
-│   │   │   ├── core/             # ApiManager (abstract), ApiRegistry, ApiField
-│   │   │   └── managers/         # Concrete ApiManager implementations (e.g. OpenWeatherApiManager)
-│   │   ├── ai/
-│   │   │   └── AIConditionBuilder.kt
-│   │   ├── service/
-│   │   │   └── BackgroundEvaluationService.kt
-│   │   ├── notification/
-│   │   │   └── NotificationService.kt
-│   │   ├── ui/
-│   │   │   ├── menu/             # AlarmMenuScreen
-│   │   │   ├── options/          # AlarmOptionsScreen
-│   │   │   ├── condition/        # ConditionTile, condition builder UI
-│   │   │   └── theme/            # Compose theme
-│   │   └── di/                   # Hilt modules
-│   └── assets/
-│       └── apis.json             # ApiRegistry config file
+src/
+├── main.rs      # CLI entry point
+├── lib.rs       # Library root
+├── paths.rs     # Path resolution (env, XDG)
+├── discovery.rs # List servers, get_server, load index/manifests
+├── sources.rs   # Registry sources (sources.list)
+├── config.rs    # Config get/set
+├── install.rs   # Install, uninstall
+├── run.rs       # Run servers (stdio spawn, SSE/WS URL)
+├── setup.rs     # Setup script execution
+
+├── browse.rs    # Browse registry servers
+├── transport.rs # Transport extraction from manifests (MVP; fetches when registry omits)
+├── connect.rs   # Connect to remote by URL (manifest or raw)
+├── elevation.rs # pkexec for system scope
+└── models.rs    # Index, Manifest, Transport structs
 ```
 
----
+## Connect
 
-## Getting Started
+`dmcp connect` supports two modes:
 
-### Prerequisites
+1. **Manifest URL** — Fetches the URL as JSON. If valid (has `id` and `transports`), uses it and applies overrides.
+2. **Raw fallback** — If fetch fails, treats URL as a raw SSE/WebSocket endpoint and auto-generates metadata.
 
-- Android Studio Hedgehog or newer
-- Android SDK 26+
-- An Anthropic API key (for AI condition building)
-- API keys for any concrete ApiManagers you enable
+## Status
 
-### Setup
+Core features implemented: list, info, config, sources, browse, install, uninstall, connect, run, setup.
 
-1. Clone the repository.
+## LLM Integration
 
-2. Create `local.properties` in the project root and add your keys:
+Run dmcp as an MCP server so LLMs (Cursor, Claude, etc.) can control it:
 
-```
-ANTHROPIC_API_KEY=sk-ant-...
-OPENWEATHER_API_KEY=...
+```bash
+dmcp serve
 ```
 
-3. Sync Gradle and run on a device or emulator (API 26+).
+Add to your MCP client config:
 
-4. The app reads `assets/apis.json` at startup to populate the `ApiRegistry`. Add or remove API entries there to control which APIs are available.
+```json
+{
+  "mcpServers": {
+    "dmcp": {
+      "command": "dmcp",
+      "args": ["serve"]
+    }
+  }
+}
+```
 
----
+See [docs/LLM-INTEGRATION.md](docs/LLM-INTEGRATION.md) for details.
 
-## Documentation
+## References
 
-| File | Description |
-|---|---|
-| [ARCHITECTURE.md](./ARCHITECTURE.md) | System design, layers, key decisions |
-| [DATA_MODEL.md](./DATA_MODEL.md) | All domain models, Room schema, JSON schemas |
-| [API_LAYER.md](./API_LAYER.md) | How ApiManager works, how to add a new one |
-| [AI_INTEGRATION.md](./AI_INTEGRATION.md) | AI condition builder, tool definitions, flow |
-| [IMPLEMENTATION_PLAN.md](./IMPLEMENTATION_PLAN.md) | Ordered build plan for the MVP |
-
----
-
-## MVP Scope
-
-The MVP includes:
-
-- Reminder list screen (create, view, delete)
-- Reminder options screen (title, description, notification method, triggerOnce)
-- Manual condition builder with at least one concrete ApiManager implemented
-- AND / OR composite condition logic
-- Background polling service that evaluates conditions
-- TTS notification and phone ringing notification
-- AI condition builder via Anthropic API tool calling
-- Persistence via Room + Moshi
-- ApiRegistry loaded from `apis.json`
-
-**Not in MVP:**
-- Temporal / duration conditions ("for 3 days", "since yesterday")
-- Remote update of apis.json
-- Multiple concrete ApiManagers (add incrementally after MVP)
+- [Model Context Protocol](https://modelcontextprotocol.io/)
+- [XDG Base Directory Specification](https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html)
