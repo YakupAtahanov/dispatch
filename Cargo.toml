@@ -3,6 +3,13 @@ name = "dispatch"
 version = "0.1.0"
 edition = "2021"
 description = "Signal-driven task orchestrator for MCP servers"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/YakupAtahanov/dispatch"
+homepage = "https://github.com/YakupAtahanov/dispatch"
+authors = ["Yakup Atahanov"]
+keywords = ["mcp", "orchestrator", "llm", "async"]
+categories = ["command-line-utilities", "asynchronous"]
+readme = "README.md"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }

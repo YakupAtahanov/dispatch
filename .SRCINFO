@@ -1,0 +1,19 @@
+pkgbase = dispatch-mcp-git
+	pkgdesc = Signal-driven task orchestrator for MCP servers
+	pkgver = 0.1.0.r0.g0000000
+	pkgrel = 1
+	url = https://github.com/YakupAtahanov/dispatch
+	arch = x86_64
+	arch = aarch64
+	license = GPL-3.0-or-later
+	makedepends = cargo
+	makedepends = git
+	depends = gcc-libs
+	optdepends = dmcp: MCP server manager for discovering and invoking servers
+	provides = dispatch-mcp
+	provides = dispatch
+	conflicts = dispatch-mcp
+	source = dispatch-mcp-git::git+https://github.com/YakupAtahanov/dispatch.git
+	sha256sums = SKIP
+
+pkgname = dispatch-mcp-git
