@@ -1,123 +1,144 @@
-# dmcp
+# dispatch
 
-**MCP Manager** — a modular, system- and user-level manager for MCP (Model Context Protocol) servers.
+**Signal-driven task orchestrator for MCP servers.**
 
-## What it does
+One LLM dispatches multiple MCP tool calls concurrently, then goes idle. `dispatch` runs those tasks in parallel and only wakes the LLM when a signal arrives — a task completes, fails, or needs attention.
 
-dmcp discovers, manages, and invokes MCP servers installed on your system. It works at two scopes:
+Multi-agent-level parallelism without loading multiple LLM instances.
 
-- **User scope** — per-user, no root required (`~/.local/share/mcp/`, `~/.config/mcp/`)
-- **System scope** — system-wide, visible to all users (`/usr/share/mcp/`, `/etc/mcp/`)
+## Why
 
-It supports both **local** (stdio) and **remote** (SSE, WebSocket) servers. Local servers are cloned and run from disk; remote servers are metadata-only, with connection endpoints stored in manifests.
+Most LLM orchestration systems either run tasks sequentially (slow) or spawn multiple LLM agents (expensive). `dispatch` takes a different approach: **one brain, many hands.** The LLM is the decision maker. MCP servers are the workers. `dispatch` is the nervous system — routing signals, tracking processes, and waking the brain only when there is something to reason about.
 
-## Features
+## Architecture
 
-- **Discovery** — List installed servers (user + system)
-- **Registry** — Browse servers from configurable registry URLs
-- **Install** — Install from registry (by ID) or from URL (manifest/endpoint)
-- **Connect** — Add remote servers by URL (fetches manifest if valid JSON, else treats as raw endpoint)
-- **Config** — Get and set per-server configuration (API keys, endpoints, etc.)
-- **Invocation** — Spawn stdio servers; SSE/WebSocket: print connection URL
-- **Setup** — Run setup scripts at install (dependencies, config) or via `dmcp setup <id>`
-
-## Configuration
-
-Paths are configurable via environment variables. Copy `.env.example` to `.env` and adjust as needed:
-
-```bash
-cp .env.example .env
+```
+LLM (any model, via client app)
+ │
+ │  MCP protocol (stdio)
+ ▼
+dispatch (Rust, Tokio async runtime)
+ │
+ │  Spawns tasks, routes signals
+ ▼
+dmcp (MCP server manager)
+ │
+ │  Discovers, runs, invokes
+ ▼
+MCP Servers (git, shell, browser, ...)
 ```
 
-See [MCP-SYSTEM-SPEC.md](MCP-SYSTEM-SPEC.md) for the full specification and [MCP-REGISTRY-GUIDE.md](MCP-REGISTRY-GUIDE.md) for registry format and install flow.
+| Component | Role |
+|-----------|------|
+| **LLM** | Decision maker. Produces dispatch lists, interprets signals. |
+| **dispatch** | Orchestrator. Spawns tasks, assigns PIDs, manages signal queue, fires reminders, exposes MCP interface. |
+| **dmcp** | Server manager. Discovers installed MCP servers, handles install/config/invocation. Required on PATH. |
+| **MCP servers** | Workers. Execute actual operations (git, file I/O, web search, etc). |
 
-## Build & Run
+## Requirements
 
-Requires [Rust](https://rustup.rs/).
+- [dmcp](https://github.com/YakupAtahanov/dmcp) installed and on PATH
+- Rust toolchain (for building from source)
 
 ```bash
+# Install dmcp first
+cargo install --git https://github.com/YakupAtahanov/dmcp
+
+# Build dispatch
 cargo build --release
-cargo install --path .   # Install to ~/.cargo/bin
+cargo install --path .
 ```
 
-## Commands
-
-| Command | Description |
-|---------|-------------|
-| `dmcp list [--user] [--system] [--json]` | List installed MCP servers (default: both) |
-| `dmcp info <id> [--json]` | Show detailed info for a server |
-| `dmcp config <id> get [key] [--json]` | Get config value(s) |
-| `dmcp config <id> set <key> <value>` | Set a config value (uses pkexec for system scope) |
-| `dmcp sources list [--user] [--system]` | List registry source URLs |
-| `dmcp sources add <url> [--system]` | Add a registry source (default: user) |
-| `dmcp sources remove <url> [--system]` | Remove a registry source |
-| `dmcp browse [url] [--user] [--system] [-k keyword...] [--json]` | Browse servers in registries (filter by keyword; transport fetched from manifest when registry omits it) |
-| `dmcp install <id or url> [--system] [--no-setup]` | Install from registry (by ID) or from manifest/endpoint URL |
-| `dmcp uninstall <id>` | Remove installed server |
-| `dmcp run <id> [--verbose]` | Run server (stdio: spawn; SSE/WebSocket: print URL) |
-| `dmcp tools <id> [--json]` | List tools on a server |
-| `dmcp call <id> <tool> [--args JSON]` | Call a tool on a server |
-| `dmcp serve` | Run dmcp as MCP server (for LLM integration) |
-| `dmcp setup <id>` | Run setup script for an installed server |
-| `dmcp connect <url> [--id] [--name] [--summary] [--version] [-c key=value...] [--system] [--no-setup]` | Connect to remote server |
-| `dmcp paths` | Show resolved paths (debug) |
-
-## Project Structure
-
-```
-src/
-├── main.rs      # CLI entry point
-├── lib.rs       # Library root
-├── paths.rs     # Path resolution (env, XDG)
-├── discovery.rs # List servers, get_server, load index/manifests
-├── sources.rs   # Registry sources (sources.list)
-├── config.rs    # Config get/set
-├── install.rs   # Install, uninstall
-├── run.rs       # Run servers (stdio spawn, SSE/WS URL)
-├── setup.rs     # Setup script execution
-
-├── browse.rs    # Browse registry servers
-├── transport.rs # Transport extraction from manifests (MVP; fetches when registry omits)
-├── connect.rs   # Connect to remote by URL (manifest or raw)
-├── elevation.rs # pkexec for system scope
-└── models.rs    # Index, Manifest, Transport structs
-```
-
-## Connect
-
-`dmcp connect` supports two modes:
-
-1. **Manifest URL** — Fetches the URL as JSON. If valid (has `id` and `transports`), uses it and applies overrides.
-2. **Raw fallback** — If fetch fails, treats URL as a raw SSE/WebSocket endpoint and auto-generates metadata.
-
-## Status
-
-Core features implemented: list, info, config, sources, browse, install, uninstall, connect, run, setup.
-
-## LLM Integration
-
-Run dmcp as an MCP server so LLMs (Cursor, Claude, etc.) can control it:
+## Usage
 
 ```bash
-dmcp serve
+dispatch serve    # Run as MCP server (stdio)
+dispatch help     # Show help
 ```
 
-Add to your MCP client config:
+Add to your MCP client config (Claude, Cursor, etc.):
 
 ```json
 {
   "mcpServers": {
-    "dmcp": {
-      "command": "dmcp",
+    "dispatch": {
+      "command": "dispatch",
       "args": ["serve"]
     }
   }
 }
 ```
 
-See [docs/LLM-INTEGRATION.md](docs/LLM-INTEGRATION.md) for details.
+## Tools
+
+| Tool | Description | Parameters |
+|------|-------------|------------|
+| `dispatch` | Dispatch tasks for concurrent execution | `tasks: [{server, tool, params, remind_after?}]` |
+| `kill` | Terminate running tasks by PID | `pids: [int]` |
+| `wait` | Acknowledge reminder, keep tasks running | `pids: [int]` |
+| `status` | Get current state of all active tasks | — |
+| `log` | Get the signal window (last N entries) | `count?: int` (default: 20) |
+
+## Signals
+
+Every event is a signal. The signal window (last 20 entries) is the LLM's working memory.
+
+| Signal | Meaning | Triggered by |
+|--------|---------|-------------|
+| `INIT` | Task started | dispatch (on spawn) |
+| `EXIT` | Task finished (success or failure) | Task completion |
+| `REMIND` | Task running beyond threshold | dispatch (timer) |
+| `WAIT` | LLM acknowledged reminder, continuing | LLM response |
+| `KILL` | Task terminated | LLM response |
+
+```
+[14:02:01] PID 1 INIT    git pull origin main
+[14:02:01] PID 2 INIT    browser search "Rust async patterns"
+[14:02:02] PID 1 EXIT    Already up to date.
+[14:02:05] PID 2 EXIT    Found 12 results: ...
+```
+
+## Example Session
+
+User: *"Update my repo, check open issues, and find API docs."*
+
+```
+[14:02:00] PID 1 INIT    git pull origin main
+[14:02:00] PID 2 INIT    github issues list --state open
+[14:02:00] PID 3 INIT    dmcp browse keywords=["api", "documentation"]
+
+[14:02:01] PID 3 EXIT    Found: openapi-mcp (validate, generate, serve)
+[14:02:02] PID 1 EXIT    Updated. 3 files changed.
+[14:02:03] PID 2 EXIT    4 open issues: #12 "Fix auth", #15 "Add tests", ...
+
+→ dispatch wakes LLM — LLM dispatches follow-up:
+
+[14:02:04] PID 4 INIT    openapi-mcp generate --spec ./api/v2.yaml
+[14:02:06] PID 4 EXIT    Generated docs at ./docs/api-v2.html
+
+→ LLM responds to user with summary
+```
+
+Total LLM invocations: 3. Wall time: ~6 seconds. Parallel tasks: 3.
+
+## Project Structure
+
+```
+src/
+├── main.rs          # CLI entry point (dispatch serve)
+├── lib.rs           # Library root
+├── orchestrator.rs  # Core event loop: spawn tasks, route signals, block until event
+├── task.rs          # Task struct, state machine (Running → Exited/Killed)
+├── signal.rs        # Signal types, rolling signal window
+├── pid.rs           # PID assignment and tracking
+├── reminder.rs      # Timer-based reminder system
+├── mcp_client.rs    # Client for calling dmcp
+├── mcp_server.rs    # MCP server interface (JSON-RPC 2.0 over stdio)
+└── error.rs         # Error types
+```
 
 ## References
 
+- [dmcp — MCP server manager](https://github.com/YakupAtahanov/dmcp)
 - [Model Context Protocol](https://modelcontextprotocol.io/)
-- [XDG Base Directory Specification](https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html)
+- [Tokio — async runtime for Rust](https://tokio.rs/)
