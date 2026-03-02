@@ -5,7 +5,7 @@ use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
 use crate::orchestrator::Orchestrator;
-use crate::task::TaskDef;
+use crate::task::{TaskDef, TimerDef};
 
 // --- JSON-RPC types ---
 
@@ -144,6 +144,28 @@ fn tool_definitions() -> Value {
                     }
                 }
             }
+        },
+        {
+            "name": "timer",
+            "description": "Set a one-shot timer. Fires a REMIND signal after the specified duration, then exits. No MCP server involved — pure delay. Use for goal deferral, scheduled re-checks, or any timed reminder. Killable via the kill tool.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "label": {
+                        "type": "string",
+                        "description": "Human-readable label for the timer (appears in signals and status)"
+                    },
+                    "duration": {
+                        "type": "integer",
+                        "description": "Seconds until the REMIND signal fires"
+                    },
+                    "metadata": {
+                        "type": "object",
+                        "description": "Arbitrary key-value data passed through to the REMIND signal (opaque to dispatch)"
+                    }
+                },
+                "required": ["label", "duration"]
+            }
         }
     ])
 }
@@ -259,6 +281,7 @@ async fn handle_tools_call(
         "wait" => handle_wait(id, arguments, orchestrator).await,
         "status" => handle_status(id, orchestrator).await,
         "log" => handle_log(id, arguments, orchestrator).await,
+        "timer" => handle_timer(id, arguments, orchestrator).await,
         _ => JsonRpcResponse::error(id, -32602, format!("Unknown tool: {}", tool_name)),
     }
 }
@@ -436,6 +459,53 @@ async fn handle_log(
             "entries": window_json
         }),
     )
+}
+
+async fn handle_timer(
+    id: Value,
+    arguments: Value,
+    orchestrator: Arc<Mutex<Orchestrator>>,
+) -> JsonRpcResponse {
+    let label = match arguments.get("label").and_then(|v| v.as_str()) {
+        Some(l) => l.to_string(),
+        None => {
+            return JsonRpcResponse::error(id, -32602, "Missing 'label' parameter");
+        }
+    };
+
+    let duration = match arguments.get("duration").and_then(|v| v.as_u64()) {
+        Some(d) => d,
+        None => {
+            return JsonRpcResponse::error(id, -32602, "Missing or invalid 'duration' parameter");
+        }
+    };
+
+    let metadata = arguments.get("metadata").cloned();
+
+    let def = TimerDef {
+        label,
+        duration,
+        metadata,
+    };
+
+    let pid = orchestrator.lock().await.dispatch_timer(def);
+
+    // Block until the timer fires (or gets killed)
+    let signal_window = orchestrator.lock().await.wait_for_event().await;
+
+    match signal_window {
+        Ok(window) => JsonRpcResponse::success(
+            id,
+            json!({
+                "content": [{
+                    "type": "text",
+                    "text": window
+                }],
+                "pid": pid
+            }),
+        ),
+        Err(e) => JsonRpcResponse::error(id, -32000, format!("Timer error: {}", e)),
+    }
 }
 
 async fn write_response(
