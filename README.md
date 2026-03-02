@@ -78,6 +78,7 @@ Add to your MCP client config (Claude, Cursor, etc.):
 | `wait` | Acknowledge reminder, keep tasks running | `pids: [int]` |
 | `status` | Get current state of all active tasks | — |
 | `log` | Get the signal window (last N entries) | `count?: int` (default: 20) |
+| `timer` | Set a one-shot timer that fires a REMIND signal after a duration | `label: string`, `duration: int` (seconds), `metadata?: object` |
 
 ## Signals
 

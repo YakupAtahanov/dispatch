@@ -33,6 +33,8 @@ pub struct SignalEntry {
     pub pid: u64,
     pub kind: SignalKind,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload: Option<serde_json::Value>,
 }
 
 impl fmt::Display for SignalEntry {
@@ -55,6 +57,22 @@ impl SignalEntry {
             pid,
             kind,
             message: message.into(),
+            payload: None,
+        }
+    }
+
+    pub fn with_payload(
+        pid: u64,
+        kind: SignalKind,
+        message: impl Into<String>,
+        payload: serde_json::Value,
+    ) -> Self {
+        Self {
+            timestamp: Local::now(),
+            pid,
+            kind,
+            message: message.into(),
+            payload: Some(payload),
         }
     }
 }
