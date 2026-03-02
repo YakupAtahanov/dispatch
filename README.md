@@ -88,7 +88,7 @@ Every event is a signal. The signal window (last 20 entries) is the LLM's workin
 |--------|---------|-------------|
 | `INIT` | Task started | dispatch (on spawn) |
 | `EXIT` | Task finished (success or failure) | Task completion |
-| `REMIND` | Task running beyond threshold | dispatch (timer) |
+| `REMIND` | Task/timer running beyond threshold | dispatch (timer or `remind_after`) |
 | `WAIT` | LLM acknowledged reminder, continuing | LLM response |
 | `KILL` | Task terminated | LLM response |
 
@@ -98,6 +98,45 @@ Every event is a signal. The signal window (last 20 entries) is the LLM's workin
 [14:02:02] PID 1 EXIT    Already up to date.
 [14:02:05] PID 2 EXIT    Found 12 results: ...
 ```
+
+## Timers
+
+Timers are one-shot delays that fire a `REMIND` signal after a duration. No MCP server is involved — just `tokio::time::sleep`. Use timers for goal deferral, scheduled re-checks, or any timed reminder.
+
+### Timer lifecycle
+
+1. Client calls the `timer` tool with a label, duration, and optional metadata.
+2. Dispatch assigns a PID and fires an `INIT` signal immediately.
+3. After `duration` seconds, dispatch fires a `REMIND` signal (with metadata passed through), then an `EXIT` signal.
+4. The timer does not repeat. To set another, dispatch a new timer.
+
+Timers are killable via the `kill` tool and visible in `status` (showing remaining time).
+
+### Timer signals
+
+| Signal | When | Payload |
+|--------|------|---------|
+| `INIT` | Timer created | `{pid, type: "INIT", label, metadata, duration}` |
+| `REMIND` | Timer expired | `{pid, type: "REMIND", label, metadata, elapsed}` |
+| `EXIT` | After REMIND fires | `{pid, type: "EXIT", label, output: "timer completed"}` |
+| `KILL` | Timer cancelled | `{pid, type: "KILL", label}` |
+
+### Timer example
+
+```
+→ LLM defers a goal: "remind me about dependency updates in 30 minutes"
+
+[14:30:00] PID 42 INIT    timer "goal_reminder:a1b2" (1800s)
+
+→ 30 minutes later...
+
+[15:00:00] PID 42 REMIND  timer "goal_reminder:a1b2" — 1800s elapsed
+[15:00:00] PID 42 EXIT    timer completed
+
+→ dispatch wakes LLM — LLM sees the REMIND signal with metadata and decides what to do
+```
+
+Metadata is opaque to dispatch — it stores and passes through whatever the client provides. This lets the client (e.g., JARVIS) track goal IDs, deferral types, or any context without dispatch needing to understand it.
 
 ## Example Session
 
