@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{self, Duration};
+use tracing::debug;
 
 /// A reminder event sent when a task exceeds its remind_after duration.
 #[derive(Debug)]
@@ -27,6 +28,7 @@ impl ReminderManager {
     /// Start a recurring reminder timer for a task.
     /// Fires every `interval_secs` until cancelled.
     pub fn start(&mut self, pid: u64, interval_secs: u64) {
+        debug!(pid, interval_secs, "starting reminder timer");
         let tx = self.tx.clone();
         let handle = tokio::spawn(async move {
             let interval = Duration::from_secs(interval_secs);
@@ -52,6 +54,7 @@ impl ReminderManager {
     /// Cancel the reminder timer for a task.
     pub fn cancel(&mut self, pid: u64) {
         if let Some(handle) = self.timers.remove(&pid) {
+            debug!(pid, "cancelling reminder timer");
             handle.abort();
         }
     }

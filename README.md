@@ -56,6 +56,15 @@ dispatch serve    # Run as MCP server (stdio)
 dispatch help     # Show help
 ```
 
+### Logging
+
+Logs go to stderr (so they don't interfere with the JSON-RPC protocol on stdout). Control verbosity with `RUST_LOG`:
+
+```bash
+RUST_LOG=dispatch=info  dispatch serve   # default — lifecycle events
+RUST_LOG=dispatch=debug dispatch serve   # + request routing, dmcp calls, signal details
+```
+
 Add to your MCP client config (Claude, Cursor, etc.):
 
 ```json

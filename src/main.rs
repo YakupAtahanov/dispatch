@@ -2,6 +2,8 @@ use std::process;
 
 use dispatch::mcp_client::DmcpClient;
 use dispatch::mcp_server;
+use tracing::{error, info};
+use tracing_subscriber::EnvFilter;
 
 fn print_usage() {
     eprintln!("dispatch — Signal-driven task orchestrator for MCP servers");
@@ -16,6 +18,17 @@ fn print_usage() {
 
 #[tokio::main]
 async fn main() {
+    // Initialize tracing — logs go to stderr so they don't interfere with
+    // the JSON-RPC protocol on stdout.  Control verbosity with RUST_LOG:
+    //   RUST_LOG=dispatch=debug  dispatch serve
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("dispatch=info")),
+        )
+        .with_writer(std::io::stderr)
+        .with_target(false)
+        .init();
+
     let args: Vec<String> = std::env::args().collect();
 
     let command = args.get(1).map(|s| s.as_str()).unwrap_or("help");
@@ -24,14 +37,15 @@ async fn main() {
         "serve" => {
             // Check dmcp availability before starting
             if let Err(e) = DmcpClient::check_available().await {
-                eprintln!("Error: {}", e);
+                error!("dmcp not found: {}", e);
                 eprintln!("Make sure dmcp is installed and on your PATH.");
                 eprintln!("  cargo install --git https://github.com/YakupAtahanov/dmcp");
                 process::exit(1);
             }
 
+            info!("starting dispatch server (stdio)");
             if let Err(e) = mcp_server::serve().await {
-                eprintln!("Server error: {}", e);
+                error!("server error: {}", e);
                 process::exit(1);
             }
         }
