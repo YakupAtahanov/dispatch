@@ -3,6 +3,7 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
+use tracing::{debug, info, warn};
 
 use crate::orchestrator::Orchestrator;
 use crate::task::{TaskDef, TimerDef};
@@ -189,6 +190,7 @@ pub async fn serve() -> io::Result<()> {
         let request: JsonRpcRequest = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(e) => {
+                warn!("JSON-RPC parse error: {}", e);
                 let resp = JsonRpcResponse::error(
                     Value::Null,
                     -32700,
@@ -202,12 +204,16 @@ pub async fn serve() -> io::Result<()> {
         let _ = &request.jsonrpc; // acknowledge field
 
         let id = request.id.clone().unwrap_or(Value::Null);
+        debug!(method = %request.method, "received JSON-RPC request");
 
         let response = match request.method.as_str() {
-            "initialize" => handle_initialize(id),
+            "initialize" => {
+                info!("client initializing");
+                handle_initialize(id)
+            }
 
             "notifications/initialized" => {
-                // Client acknowledgment, no response needed
+                info!("client initialized");
                 continue;
             }
 
@@ -224,6 +230,7 @@ pub async fn serve() -> io::Result<()> {
                 if request.id.is_none() {
                     continue;
                 }
+                warn!(method = %request.method, "unknown method");
                 JsonRpcResponse::error(id, -32601, "Method not found")
             }
         };
@@ -275,6 +282,7 @@ async fn handle_tools_call(
         .cloned()
         .unwrap_or(json!({}));
 
+    info!(tool = tool_name, "tools/call");
     match tool_name {
         "dispatch" => handle_dispatch(id, arguments, orchestrator).await,
         "kill" => handle_kill(id, arguments, orchestrator).await,
@@ -282,7 +290,10 @@ async fn handle_tools_call(
         "status" => handle_status(id, orchestrator).await,
         "log" => handle_log(id, arguments, orchestrator).await,
         "timer" => handle_timer(id, arguments, orchestrator).await,
-        _ => JsonRpcResponse::error(id, -32602, format!("Unknown tool: {}", tool_name)),
+        _ => {
+            warn!(tool = tool_name, "unknown tool called");
+            JsonRpcResponse::error(id, -32602, format!("Unknown tool: {}", tool_name))
+        }
     }
 }
 

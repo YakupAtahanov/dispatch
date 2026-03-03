@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
+use tracing::{debug, info, warn};
 
 use crate::error::{DispatchError, Result};
 use crate::mcp_client::DmcpClient;
@@ -56,12 +57,14 @@ impl Orchestrator {
 
     /// Dispatch a list of MCP tasks. Returns the assigned PIDs.
     pub fn dispatch(&mut self, task_defs: Vec<TaskDef>) -> Vec<u64> {
+        info!(count = task_defs.len(), "dispatching MCP tasks");
         let mut pids = Vec::with_capacity(task_defs.len());
 
         for def in task_defs {
             let task_pid = pid::next_pid();
             let remind_after = def.remind_after;
             let mut task = Task::new_mcp(task_pid, def);
+            debug!(pid = task_pid, desc = %task.description(), "spawning MCP task");
 
             // Log INIT signal
             self.signal_window.push(SignalEntry::new(
@@ -109,6 +112,7 @@ impl Orchestrator {
     /// Dispatch a timer. Returns the assigned PID.
     pub fn dispatch_timer(&mut self, def: TimerDef) -> u64 {
         let task_pid = pid::next_pid();
+        info!(pid = task_pid, label = %def.label, duration = def.duration, "dispatching timer");
         let mut task = Task::new_timer(task_pid, def.clone());
 
         // Log INIT signal
@@ -152,6 +156,7 @@ impl Orchestrator {
 
     /// Kill tasks by PID. Returns which PIDs were actually killed.
     pub fn kill(&mut self, pids: &[u64]) -> Result<Vec<u64>> {
+        debug!(pids = ?pids, "kill requested");
         let mut killed = Vec::new();
 
         for &task_pid in pids {
@@ -161,6 +166,7 @@ impl Orchestrator {
                 .ok_or(DispatchError::TaskNotFound(task_pid))?;
 
             if !task.is_running() {
+                debug!(pid = task_pid, "skip kill — task not running");
                 continue;
             }
 
@@ -177,6 +183,7 @@ impl Orchestrator {
             task.mark_killed();
             self.reminder_mgr.cancel(task_pid);
 
+            info!(pid = task_pid, %message, "task killed");
             self.signal_window.push(SignalEntry::new(
                 task_pid,
                 SignalKind::Kill,
@@ -242,9 +249,11 @@ impl Orchestrator {
     /// This is the blocking call that keeps the LLM "asleep" until something happens.
     pub async fn wait_for_event(&mut self) -> Result<String> {
         if !self.has_running_tasks() {
+            debug!("wait_for_event: no running tasks, returning immediately");
             return Ok(self.signal_window.format_window(DEFAULT_WINDOW_SIZE));
         }
 
+        debug!("wait_for_event: blocking until next event");
         loop {
             tokio::select! {
                 // A task completed
@@ -253,6 +262,7 @@ impl Orchestrator {
 
                     // If all tasks are done, return immediately
                     if !self.has_running_tasks() {
+                        debug!("all tasks completed, waking LLM");
                         return Ok(self.signal_window.format_window(DEFAULT_WINDOW_SIZE));
                     }
                 }
@@ -262,6 +272,7 @@ impl Orchestrator {
                     // Only fire reminder if task is still running
                     if let Some(task) = self.tasks.get(&event.pid) {
                         if task.is_running() {
+                            info!(pid = event.pid, elapsed = event.elapsed_secs, "reminder fired, waking LLM");
                             self.signal_window.push(SignalEntry::new(
                                 event.pid,
                                 SignalKind::Remind,
@@ -274,6 +285,7 @@ impl Orchestrator {
                 }
 
                 else => {
+                    warn!("event channels closed unexpectedly");
                     return Err(DispatchError::ChannelClosed);
                 }
             }
@@ -291,8 +303,12 @@ impl Orchestrator {
         self.reminder_mgr.cancel(result.pid);
 
         match result.kind {
-            TaskResultKind::McpComplete(output) => {
-                let message = match &output {
+            TaskResultKind::McpComplete(ref output) => {
+                match output {
+                    Ok(_) => info!(pid = result.pid, "MCP task completed"),
+                    Err(ref e) => warn!(pid = result.pid, error = %e, "MCP task failed"),
+                }
+                let message = match output {
                     Ok(out) => {
                         if out.is_empty() {
                             "(no output)".to_string()
@@ -314,6 +330,7 @@ impl Orchestrator {
                 metadata,
                 elapsed,
             } => {
+                info!(pid = result.pid, %label, elapsed, "timer expired");
                 // Fire REMIND signal with full payload
                 self.signal_window.push(SignalEntry::with_payload(
                     result.pid,
@@ -344,6 +361,7 @@ impl Orchestrator {
 
     /// Clean up: kill all running tasks.
     pub fn shutdown(&mut self) {
+        info!("shutting down orchestrator");
         let running_pids: Vec<u64> = self
             .tasks
             .values()

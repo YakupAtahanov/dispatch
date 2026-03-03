@@ -1,5 +1,6 @@
 use crate::error::{DispatchError, Result};
 use tokio::process::Command;
+use tracing::{debug, warn};
 
 /// Client for invoking dmcp commands.
 /// dispatch delegates all MCP server management to dmcp.
@@ -27,6 +28,7 @@ impl DmcpClient {
         tool: &str,
         params: &serde_json::Value,
     ) -> Result<String> {
+        debug!(server, tool, "calling dmcp tool");
         let mut cmd = Command::new("dmcp");
         cmd.arg("call").arg(server).arg(tool);
 
@@ -35,16 +37,19 @@ impl DmcpClient {
         }
 
         let output = cmd.output().await.map_err(|e| {
+            warn!(server, tool, error = %e, "failed to spawn dmcp");
             DispatchError::DmcpError(format!("failed to spawn dmcp: {}", e))
         })?;
 
         if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            debug!(server, tool, "dmcp call succeeded");
             Ok(stdout.trim().to_string())
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
             let msg = if stderr.is_empty() { stdout } else { stderr };
+            warn!(server, tool, error = %msg.trim(), "dmcp call failed");
             Err(DispatchError::DmcpError(msg.trim().to_string()))
         }
     }
