@@ -5,6 +5,7 @@ use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
+use crate::mcp_client::DmcpClient;
 use crate::orchestrator::Orchestrator;
 use crate::task::{TaskDef, TimerDef};
 
@@ -167,6 +168,101 @@ fn tool_definitions() -> Value {
                 },
                 "required": ["label", "duration"]
             }
+        },
+        {
+            "name": "browse_servers",
+            "description": "Search the MCP server registry using a vector (embedding). Returns the top-k most similar servers above the minimum score threshold.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "vector": {
+                        "type": "array",
+                        "items": { "type": "number" },
+                        "description": "Query embedding vector"
+                    },
+                    "top_k": {
+                        "type": "integer",
+                        "description": "Maximum number of results to return"
+                    },
+                    "min_score": {
+                        "type": "number",
+                        "description": "Minimum similarity score threshold (0.0–1.0)"
+                    }
+                },
+                "required": ["vector", "top_k", "min_score"]
+            }
+        },
+        {
+            "name": "browse_servers_batch",
+            "description": "Search the MCP server registry with multiple vectors in a single call. Returns results grouped by input vector index. Use when dispatching a plan with multiple sub-tasks that each need server discovery.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "vectors": {
+                        "type": "array",
+                        "items": {
+                            "type": "array",
+                            "items": { "type": "number" }
+                        },
+                        "description": "Array of query embedding vectors"
+                    },
+                    "top_k": {
+                        "type": "integer",
+                        "description": "Maximum number of results per vector"
+                    },
+                    "min_score": {
+                        "type": "number",
+                        "description": "Minimum similarity score threshold (0.0–1.0)"
+                    }
+                },
+                "required": ["vectors", "top_k", "min_score"]
+            }
+        },
+        {
+            "name": "server_count",
+            "description": "Get the number of MCP servers visible in the registry. Use this to decide whether to use vector or keyword search.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        },
+        {
+            "name": "embedding_spec",
+            "description": "Get the embedding model specification used by the registry (model name, version, dimensions). Use this to produce vectors compatible with the registry's index.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        },
+        {
+            "name": "sync_index",
+            "description": "Refresh the local vector index from the registry. Run this before vector searches when the index may be stale.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        },
+        {
+            "name": "index_server",
+            "description": "Add a non-approved server to the local vector index so it can be found via vector search.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "server_id": {
+                        "type": "string",
+                        "description": "ID of the server to index"
+                    },
+                    "vectors": {
+                        "type": "array",
+                        "items": {
+                            "type": "array",
+                            "items": { "type": "number" }
+                        },
+                        "description": "Embedding vectors representing the server"
+                    }
+                },
+                "required": ["server_id", "vectors"]
+            }
         }
     ])
 }
@@ -290,6 +386,12 @@ async fn handle_tools_call(
         "status" => handle_status(id, orchestrator).await,
         "log" => handle_log(id, arguments, orchestrator).await,
         "timer" => handle_timer(id, arguments, orchestrator).await,
+        "browse_servers" => handle_browse_servers(id, arguments).await,
+        "browse_servers_batch" => handle_browse_servers_batch(id, arguments).await,
+        "server_count" => handle_server_count(id).await,
+        "embedding_spec" => handle_embedding_spec(id).await,
+        "sync_index" => handle_sync_index(id).await,
+        "index_server" => handle_index_server(id, arguments).await,
         _ => {
             warn!(tool = tool_name, "unknown tool called");
             JsonRpcResponse::error(id, -32602, format!("Unknown tool: {}", tool_name))
@@ -516,6 +618,108 @@ async fn handle_timer(
             }),
         ),
         Err(e) => JsonRpcResponse::error(id, -32000, format!("Timer error: {}", e)),
+    }
+}
+
+async fn handle_browse_servers(id: Value, arguments: Value) -> JsonRpcResponse {
+    let vector: Vec<f64> = match arguments.get("vector") {
+        Some(v) => match serde_json::from_value(v.clone()) {
+            Ok(vec) => vec,
+            Err(e) => return JsonRpcResponse::error(id, -32602, format!("Invalid vector: {}", e)),
+        },
+        None => return JsonRpcResponse::error(id, -32602, "Missing 'vector' parameter"),
+    };
+    let top_k = match arguments.get("top_k").and_then(|v| v.as_u64()) {
+        Some(n) => n,
+        None => return JsonRpcResponse::error(id, -32602, "Missing or invalid 'top_k' parameter"),
+    };
+    let min_score = match arguments.get("min_score").and_then(|v| v.as_f64()) {
+        Some(f) => f,
+        None => return JsonRpcResponse::error(id, -32602, "Missing or invalid 'min_score' parameter"),
+    };
+
+    match DmcpClient::browse_vector(&vector, top_k, min_score).await {
+        Ok(results) => JsonRpcResponse::success(id, json!({
+            "content": [{ "type": "text", "text": results.to_string() }],
+            "results": results
+        })),
+        Err(e) => JsonRpcResponse::error(id, -32000, e.to_string()),
+    }
+}
+
+async fn handle_browse_servers_batch(id: Value, arguments: Value) -> JsonRpcResponse {
+    let vectors: Vec<Vec<f64>> = match arguments.get("vectors") {
+        Some(v) => match serde_json::from_value(v.clone()) {
+            Ok(vecs) => vecs,
+            Err(e) => return JsonRpcResponse::error(id, -32602, format!("Invalid vectors: {}", e)),
+        },
+        None => return JsonRpcResponse::error(id, -32602, "Missing 'vectors' parameter"),
+    };
+    let top_k = match arguments.get("top_k").and_then(|v| v.as_u64()) {
+        Some(n) => n,
+        None => return JsonRpcResponse::error(id, -32602, "Missing or invalid 'top_k' parameter"),
+    };
+    let min_score = match arguments.get("min_score").and_then(|v| v.as_f64()) {
+        Some(f) => f,
+        None => return JsonRpcResponse::error(id, -32602, "Missing or invalid 'min_score' parameter"),
+    };
+
+    match DmcpClient::browse_vectors(&vectors, top_k, min_score).await {
+        Ok(results) => JsonRpcResponse::success(id, json!({
+            "content": [{ "type": "text", "text": results.to_string() }],
+            "results": results
+        })),
+        Err(e) => JsonRpcResponse::error(id, -32000, e.to_string()),
+    }
+}
+
+async fn handle_server_count(id: Value) -> JsonRpcResponse {
+    match DmcpClient::server_count().await {
+        Ok(count) => JsonRpcResponse::success(id, json!({
+            "content": [{ "type": "text", "text": count.to_string() }],
+            "count": count
+        })),
+        Err(e) => JsonRpcResponse::error(id, -32000, e.to_string()),
+    }
+}
+
+async fn handle_embedding_spec(id: Value) -> JsonRpcResponse {
+    match DmcpClient::embedding_spec().await {
+        Ok(spec) => JsonRpcResponse::success(id, json!({
+            "content": [{ "type": "text", "text": spec.to_string() }],
+            "spec": spec
+        })),
+        Err(e) => JsonRpcResponse::error(id, -32000, e.to_string()),
+    }
+}
+
+async fn handle_sync_index(id: Value) -> JsonRpcResponse {
+    match DmcpClient::sync_index().await {
+        Ok(output) => JsonRpcResponse::success(id, json!({
+            "content": [{ "type": "text", "text": output }]
+        })),
+        Err(e) => JsonRpcResponse::error(id, -32000, e.to_string()),
+    }
+}
+
+async fn handle_index_server(id: Value, arguments: Value) -> JsonRpcResponse {
+    let server_id = match arguments.get("server_id").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => return JsonRpcResponse::error(id, -32602, "Missing 'server_id' parameter"),
+    };
+    let vectors: Vec<Vec<f64>> = match arguments.get("vectors") {
+        Some(v) => match serde_json::from_value(v.clone()) {
+            Ok(vecs) => vecs,
+            Err(e) => return JsonRpcResponse::error(id, -32602, format!("Invalid vectors: {}", e)),
+        },
+        None => return JsonRpcResponse::error(id, -32602, "Missing 'vectors' parameter"),
+    };
+
+    match DmcpClient::index_server(&server_id, &vectors).await {
+        Ok(output) => JsonRpcResponse::success(id, json!({
+            "content": [{ "type": "text", "text": output }]
+        })),
+        Err(e) => JsonRpcResponse::error(id, -32000, e.to_string()),
     }
 }
 
