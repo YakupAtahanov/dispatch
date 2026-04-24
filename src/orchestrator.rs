@@ -66,12 +66,13 @@ impl Orchestrator {
             let mut task = Task::new_mcp(task_pid, def);
             debug!(pid = task_pid, desc = %task.description(), "spawning MCP task");
 
-            // Log INIT signal
-            self.signal_window.push(SignalEntry::new(
-                task_pid,
-                SignalKind::Init,
-                task.description(),
-            ));
+            // Log INIT signal with the task's provenance nonce
+            let init_entry = SignalEntry::new(task_pid, SignalKind::Init, task.description());
+            let init_entry = match task.nonce.as_deref() {
+                Some(h) => init_entry.with_nonce(h),
+                None => init_entry,
+            };
+            self.signal_window.push(init_entry);
 
             // Start reminder timer if configured
             if let Some(secs) = remind_after {
@@ -115,7 +116,7 @@ impl Orchestrator {
         info!(pid = task_pid, label = %def.label, duration = def.duration, "dispatching timer");
         let mut task = Task::new_timer(task_pid, def.clone());
 
-        // Log INIT signal
+        // Log INIT signal (timers carry no nonce — output is hardcoded, not external)
         self.signal_window.push(SignalEntry::with_payload(
             task_pid,
             SignalKind::Init,
@@ -302,13 +303,17 @@ impl Orchestrator {
     fn handle_task_result(&mut self, result: TaskResult) {
         self.reminder_mgr.cancel(result.pid);
 
+        // Snapshot nonce before mutably borrowing signal_window
+        let task_nonce = self.tasks.get(&result.pid).and_then(|t| t.nonce.clone());
+
         match result.kind {
             TaskResultKind::McpComplete(ref output) => {
                 match output {
                     Ok(_) => info!(pid = result.pid, "MCP task completed"),
                     Err(ref e) => warn!(pid = result.pid, error = %e, "MCP task failed"),
                 }
-                let message = match output {
+
+                let raw = match output {
                     Ok(out) => {
                         if out.is_empty() {
                             "(no output)".to_string()
@@ -319,11 +324,20 @@ impl Orchestrator {
                     Err(err) => err.clone(),
                 };
 
-                self.signal_window.push(SignalEntry::new(
-                    result.pid,
-                    SignalKind::Exit,
-                    message,
-                ));
+                // Wrap output in provenance delimiters so the LLM treats it as data
+                let message = match task_nonce.as_deref() {
+                    Some(h) => format!("<{h}>{raw}</{h}>"),
+                    None => raw,
+                };
+
+                let exit_entry = match task_nonce {
+                    Some(h) => {
+                        SignalEntry::new(result.pid, SignalKind::Exit, message).with_nonce(h)
+                    }
+                    None => SignalEntry::new(result.pid, SignalKind::Exit, message),
+                };
+
+                self.signal_window.push(exit_entry);
             }
             TaskResultKind::TimerExpired {
                 label,
@@ -438,6 +452,10 @@ mod tests {
 
         // EXIT message should indicate timer completed
         assert!(signals[2].message.contains("timer completed"));
+
+        // Timer signals carry no nonce
+        assert!(signals[0].nonce.is_none());
+        assert!(signals[2].nonce.is_none());
 
         // No more running tasks
         assert!(!orch.has_running_tasks());

@@ -43,6 +43,8 @@ pub struct Task {
     pub kind: TaskKind,
     pub state: TaskState,
     pub started_at: Instant,
+    /// Provenance nonce for MCP tasks; None for timers (no external output).
+    pub nonce: Option<String>,
     /// Handle to cancel the running task.
     pub abort_handle: Option<tokio::task::AbortHandle>,
 }
@@ -54,6 +56,7 @@ impl Task {
             kind: TaskKind::Mcp(def),
             state: TaskState::Running,
             started_at: Instant::now(),
+            nonce: Some(crate::nonce::generate(pid)),
             abort_handle: None,
         }
     }
@@ -64,6 +67,7 @@ impl Task {
             kind: TaskKind::Timer(def),
             state: TaskState::Running,
             started_at: Instant::now(),
+            nonce: None,
             abort_handle: None,
         }
     }
@@ -90,7 +94,7 @@ impl Task {
                     } else {
                         format!(" {}", def.params)
                     };
-                format!("{} {}{}", def.server, def.tool, params_str)
+                format!("{}/{}{}", def.server, def.tool, params_str)
             }
             TaskKind::Timer(def) => {
                 format!("timer \"{}\" ({}s)", def.label, def.duration)

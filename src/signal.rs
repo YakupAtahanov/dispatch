@@ -35,18 +35,32 @@ pub struct SignalEntry {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub payload: Option<serde_json::Value>,
+    /// Output-provenance nonce for MCP tasks; None for timers/kill/wait/remind.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nonce: Option<String>,
 }
 
 impl fmt::Display for SignalEntry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "[{}] PID {} {:<8} {}",
-            self.timestamp.format("%H:%M:%S"),
-            self.pid,
-            self.kind,
-            self.message
-        )
+        match &self.nonce {
+            Some(h) => write!(
+                f,
+                "[{}] PID {} [h={}] {:<8} {}",
+                self.timestamp.format("%H:%M:%S"),
+                self.pid,
+                h,
+                self.kind,
+                self.message
+            ),
+            None => write!(
+                f,
+                "[{}] PID {} {:<8} {}",
+                self.timestamp.format("%H:%M:%S"),
+                self.pid,
+                self.kind,
+                self.message
+            ),
+        }
     }
 }
 
@@ -58,6 +72,7 @@ impl SignalEntry {
             kind,
             message: message.into(),
             payload: None,
+            nonce: None,
         }
     }
 
@@ -73,7 +88,14 @@ impl SignalEntry {
             kind,
             message: message.into(),
             payload: Some(payload),
+            nonce: None,
         }
+    }
+
+    /// Attach an output-provenance nonce (builder pattern).
+    pub fn with_nonce(mut self, nonce: impl Into<String>) -> Self {
+        self.nonce = Some(nonce.into());
+        self
     }
 }
 
@@ -164,5 +186,23 @@ mod tests {
         assert_eq!(last2.len(), 2);
         assert_eq!(last2[0].pid, 4);
         assert_eq!(last2[1].pid, 5);
+    }
+
+    #[test]
+    fn display_includes_nonce_when_set() {
+        let entry =
+            SignalEntry::new(7, SignalKind::Init, "shellmcp/run_command").with_nonce("a3f2");
+        let s = format!("{}", entry);
+        assert!(s.contains("[h=a3f2]"), "expected [h=a3f2] in: {}", s);
+        assert!(s.contains("PID 7"), "expected PID 7 in: {}", s);
+        assert!(s.contains("INIT"), "expected INIT in: {}", s);
+    }
+
+    #[test]
+    fn display_omits_nonce_when_absent() {
+        let entry = SignalEntry::new(3, SignalKind::Exit, "timer completed");
+        let s = format!("{}", entry);
+        assert!(!s.contains("[h="), "no nonce tag expected in: {}", s);
+        assert!(s.contains("PID 3"), "expected PID 3 in: {}", s);
     }
 }
