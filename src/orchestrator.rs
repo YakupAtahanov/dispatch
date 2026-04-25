@@ -16,7 +16,6 @@ const DEFAULT_WINDOW_SIZE: usize = 20;
 const REMINDER_CHANNEL_SIZE: usize = 64;
 const TASK_CHANNEL_SIZE: usize = 64;
 
-/// Event from a completed task.
 struct TaskResult {
     pid: u64,
     kind: TaskResultKind,
@@ -39,9 +38,9 @@ pub struct Orchestrator {
     reminder_rx: mpsc::Receiver<ReminderEvent>,
     task_result_rx: mpsc::Receiver<TaskResult>,
     task_result_tx: mpsc::Sender<TaskResult>,
-    /// Stored output for successfully completed MCP tasks.
-    /// Keyed by PID. Not shown in the signal window (200 suppresses content)
-    /// but available via get_output() for programmatic retrieval.
+    /// Stored output for successfully completed MCP tasks (200 exits).
+    /// Keyed by PID. Suppressed from the signal window to save LLM context;
+    /// retrieve via get_output(pid) / the get_output MCP tool.
     outputs: HashMap<u64, String>,
 }
 
@@ -60,7 +59,6 @@ impl Orchestrator {
         }
     }
 
-    /// Dispatch a list of MCP tasks. Returns the assigned PIDs.
     pub fn dispatch(&mut self, task_defs: Vec<TaskDef>) -> Vec<u64> {
         info!(count = task_defs.len(), "dispatching MCP tasks");
         let mut pids = Vec::with_capacity(task_defs.len());
@@ -71,21 +69,19 @@ impl Orchestrator {
             let mut task = Task::new_mcp(task_pid, def);
             debug!(pid = task_pid, desc = %task.description(), "spawning MCP task");
 
-            // INIT signal: no hash shown — nonce is internal until EXIT
+            // INIT signal carries no hash — nonce is internal until EXIT
             self.signal_window.push(SignalEntry::new(
                 task_pid,
                 SignalKind::Init,
                 task.description(),
             ));
 
-            // Start reminder timer if configured
             if let Some(secs) = remind_after {
                 if secs > 0 {
                     self.reminder_mgr.start(task_pid, secs);
                 }
             }
 
-            // Spawn the async task
             let tx = self.task_result_tx.clone();
             let mcp_def = task.mcp_def();
             let server = mcp_def.server.clone();
@@ -114,7 +110,6 @@ impl Orchestrator {
         pids
     }
 
-    /// Dispatch a timer. Returns the assigned PID.
     pub fn dispatch_timer(&mut self, def: TimerDef) -> u64 {
         let task_pid = pid::next_pid();
         info!(pid = task_pid, label = %def.label, duration = def.duration, "dispatching timer");
@@ -157,7 +152,6 @@ impl Orchestrator {
         task_pid
     }
 
-    /// Kill tasks by PID. Returns which PIDs were actually killed.
     pub fn kill(&mut self, pids: &[u64]) -> Result<Vec<u64>> {
         debug!(pids = ?pids, "kill requested");
         let mut killed = Vec::new();
@@ -198,7 +192,6 @@ impl Orchestrator {
         Ok(killed)
     }
 
-    /// Acknowledge reminders for tasks, letting them continue.
     pub fn wait(&mut self, pids: &[u64]) -> Result<Vec<u64>> {
         let mut waited = Vec::new();
 
@@ -224,37 +217,34 @@ impl Orchestrator {
         Ok(waited)
     }
 
-    /// Get status of all tasks.
     pub fn status(&self) -> Vec<TaskStatus> {
         self.tasks.values().map(TaskStatus::from).collect()
     }
 
-    /// Retrieve stored output for a successfully completed MCP task.
-    /// Returns None if the PID is unknown or the task failed.
+    /// Retrieve stored output for a successfully completed MCP task (200 exit).
     pub fn get_output(&self, pid: u64) -> Option<&str> {
         self.outputs.get(&pid).map(|s| s.as_str())
     }
 
-    /// Get the signal window formatted as text.
+    /// Retrieve the provenance nonce for a task (MCP tasks only).
+    pub fn get_nonce(&self, pid: u64) -> Option<&str> {
+        self.tasks.get(&pid).and_then(|t| t.nonce.as_deref())
+    }
+
     pub fn log_text(&self, count: usize) -> String {
         self.signal_window.format_window(count)
     }
 
-    /// Get the signal window as JSON.
     pub fn log_json(&self, count: usize) -> serde_json::Value {
         self.signal_window.to_json(count)
     }
 
-    /// Check if there are any running tasks.
     pub fn has_running_tasks(&self) -> bool {
         self.tasks
             .values()
             .any(|t| t.state == TaskState::Running)
     }
 
-    /// Wait for the next event (task completion or reminder).
-    /// Returns the updated signal window as text.
-    /// This is the blocking call that keeps the LLM "asleep" until something happens.
     pub async fn wait_for_event(&mut self) -> Result<String> {
         if !self.has_running_tasks() {
             debug!("wait_for_event: no running tasks, returning immediately");
@@ -266,13 +256,11 @@ impl Orchestrator {
             tokio::select! {
                 Some(result) = self.task_result_rx.recv() => {
                     self.handle_task_result(result);
-
                     if !self.has_running_tasks() {
                         debug!("all tasks completed, waking LLM");
                         return Ok(self.signal_window.format_window(DEFAULT_WINDOW_SIZE));
                     }
                 }
-
                 Some(event) = self.reminder_rx.recv() => {
                     if let Some(task) = self.tasks.get(&event.pid) {
                         if task.is_running() {
@@ -286,7 +274,6 @@ impl Orchestrator {
                         }
                     }
                 }
-
                 else => {
                     warn!("event channels closed unexpectedly");
                     return Err(DispatchError::ChannelClosed);
@@ -295,7 +282,6 @@ impl Orchestrator {
         }
     }
 
-    /// Drain any pending task results without blocking.
     pub fn drain_results(&mut self) {
         while let Ok(result) = self.task_result_rx.try_recv() {
             self.handle_task_result(result);
@@ -304,8 +290,6 @@ impl Orchestrator {
 
     fn handle_task_result(&mut self, result: TaskResult) {
         self.reminder_mgr.cancel(result.pid);
-
-        // Snapshot nonce before borrowing signal_window
         let task_nonce = self.tasks.get(&result.pid).and_then(|t| t.nonce.clone());
 
         match result.kind {
@@ -313,14 +297,7 @@ impl Orchestrator {
                 let exit_entry = match output {
                     Ok(out) => {
                         info!(pid = result.pid, "MCP task completed");
-                        let raw = if out.is_empty() {
-                            "(no output)".to_string()
-                        } else {
-                            out
-                        };
-                        // Store output for retrieval via get_output(pid).
-                        // Signal shows only the status code — suppresses content
-                        // from the LLM context window on success.
+                        let raw = if out.is_empty() { "(no output)".to_string() } else { out };
                         self.outputs.insert(result.pid, raw);
                         let message = match task_nonce.as_deref() {
                             Some(h) => format!("[hash={h}] 200"),
@@ -334,8 +311,6 @@ impl Orchestrator {
                     }
                     Err(err) => {
                         warn!(pid = result.pid, error = %err, "MCP task failed");
-                        // On error, show the content wrapped in hash tags so the LLM
-                        // treats it as opaque data (injection-safe error boundary).
                         let message = match task_nonce.as_deref() {
                             Some(h) => format!("[hash={h}] 500 <{h}>{err}</{h}>"),
                             None => format!("500 {err}"),
@@ -349,11 +324,7 @@ impl Orchestrator {
                 };
                 self.signal_window.push(exit_entry);
             }
-            TaskResultKind::TimerExpired {
-                label,
-                metadata,
-                elapsed,
-            } => {
+            TaskResultKind::TimerExpired { label, metadata, elapsed } => {
                 info!(pid = result.pid, %label, elapsed, "timer expired");
                 self.signal_window.push(SignalEntry::with_payload(
                     result.pid,
@@ -380,7 +351,6 @@ impl Orchestrator {
         }
     }
 
-    /// Clean up: kill all running tasks.
     pub fn shutdown(&mut self) {
         info!("shutting down orchestrator");
         let running_pids: Vec<u64> = self
@@ -389,7 +359,6 @@ impl Orchestrator {
             .filter(|t| t.is_running())
             .map(|t| t.pid)
             .collect();
-
         for task_pid in running_pids {
             if let Some(task) = self.tasks.get_mut(&task_pid) {
                 if let Some(handle) = task.abort_handle.take() {
@@ -398,7 +367,6 @@ impl Orchestrator {
                 task.mark_killed();
             }
         }
-
         self.reminder_mgr.cancel_all();
     }
 }
@@ -416,11 +384,7 @@ mod tests {
     use crate::task::TimerDef;
 
     fn timer_def(label: &str, duration: u64, metadata: Option<serde_json::Value>) -> TimerDef {
-        TimerDef {
-            label: label.to_string(),
-            duration,
-            metadata,
-        }
+        TimerDef { label: label.to_string(), duration, metadata }
     }
 
     #[tokio::test(start_paused = true)]
@@ -428,35 +392,26 @@ mod tests {
         let mut orch = Orchestrator::new();
         let pid = orch.dispatch_timer(timer_def("test_timer", 2, None));
         assert!(pid > 0);
-
         let signals = orch.signal_window.all();
         assert_eq!(signals.len(), 1);
         assert_eq!(signals[0].kind, SignalKind::Init);
         assert!(signals[0].message.contains("test_timer"));
-        // INIT signals never carry a hash
         assert!(signals[0].nonce.is_none());
-
         assert!(orch.has_running_tasks());
-
         let result = orch.wait_for_event().await;
         assert!(result.is_ok());
-
         let signals = orch.signal_window.all();
         assert_eq!(signals.len(), 3);
         assert_eq!(signals[0].kind, SignalKind::Init);
         assert_eq!(signals[1].kind, SignalKind::Remind);
         assert_eq!(signals[2].kind, SignalKind::Exit);
-
         let payload = signals[1].payload.as_ref().expect("REMIND should have payload");
         assert_eq!(payload["type"], "REMIND");
         assert_eq!(payload["label"], "test_timer");
         assert_eq!(payload["elapsed"], 2);
         assert_eq!(payload["pid"], pid);
-
         assert!(signals[2].message.contains("timer completed"));
-        // Timer EXIT carries no hash (output is hardcoded, not external)
         assert!(signals[2].nonce.is_none());
-
         assert!(!orch.has_running_tasks());
     }
 
@@ -464,21 +419,16 @@ mod tests {
     async fn kill_timer_prevents_remind() {
         let mut orch = Orchestrator::new();
         let pid = orch.dispatch_timer(timer_def("kill_me", 60, None));
-
         tokio::time::advance(Duration::from_secs(1)).await;
-
         let killed = orch.kill(&[pid]).expect("kill should succeed");
         assert_eq!(killed, vec![pid]);
-
         let signals = orch.signal_window.all();
         assert_eq!(signals.len(), 2);
         assert_eq!(signals[0].kind, SignalKind::Init);
         assert_eq!(signals[1].kind, SignalKind::Kill);
         assert!(signals[1].message.contains("cancelled"));
-
         tokio::time::advance(Duration::from_secs(120)).await;
         orch.drain_results();
-
         assert_eq!(orch.signal_window.all().len(), 2);
         assert!(!orch.has_running_tasks());
     }
@@ -486,24 +436,15 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn multiple_timers_fire_independently() {
         let mut orch = Orchestrator::new();
-
         let pid1 = orch.dispatch_timer(timer_def("fast", 1, None));
         let pid2 = orch.dispatch_timer(timer_def("medium", 3, None));
         let pid3 = orch.dispatch_timer(timer_def("slow", 5, None));
-
         assert_eq!(orch.signal_window.all().len(), 3);
-
         let _ = orch.wait_for_event().await;
-
         let signals = orch.signal_window.all();
-        assert_eq!(signals.len(), 9); // 3 INIT + 3 REMIND + 3 EXIT
-
-        let reminds: Vec<_> = signals
-            .iter()
-            .filter(|s| s.kind == SignalKind::Remind)
-            .collect();
+        assert_eq!(signals.len(), 9);
+        let reminds: Vec<_> = signals.iter().filter(|s| s.kind == SignalKind::Remind).collect();
         assert_eq!(reminds.len(), 3);
-
         let mut remind_pids: Vec<u64> = reminds.iter().map(|s| s.pid).collect();
         remind_pids.sort();
         remind_pids.dedup();
@@ -511,29 +452,17 @@ mod tests {
         assert!(remind_pids.contains(&pid1));
         assert!(remind_pids.contains(&pid2));
         assert!(remind_pids.contains(&pid3));
-
         assert!(!orch.has_running_tasks());
     }
 
     #[tokio::test(start_paused = true)]
     async fn metadata_passthrough() {
-        let meta = json!({
-            "goal_id": "abc123",
-            "type": "goal_defer",
-            "priority": 5
-        });
-
+        let meta = json!({"goal_id": "abc123", "type": "goal_defer", "priority": 5});
         let mut orch = Orchestrator::new();
         let pid = orch.dispatch_timer(timer_def("goal_reminder", 2, Some(meta.clone())));
-
-        let init_payload = orch.signal_window.all()[0]
-            .payload
-            .as_ref()
-            .expect("INIT should have payload");
+        let init_payload = orch.signal_window.all()[0].payload.as_ref().expect("INIT should have payload");
         assert_eq!(init_payload["metadata"], meta);
-
         let _ = orch.wait_for_event().await;
-
         let signals = orch.signal_window.all();
         let remind = signals.iter().find(|s| s.kind == SignalKind::Remind).unwrap();
         let remind_payload = remind.payload.as_ref().expect("REMIND should have payload");
@@ -546,19 +475,16 @@ mod tests {
     async fn status_shows_timer_with_remaining_time() {
         let mut orch = Orchestrator::new();
         orch.dispatch_timer(timer_def("check_build", 60, None));
-
         tokio::time::advance(Duration::from_secs(10)).await;
-
         let statuses = orch.status();
         assert_eq!(statuses.len(), 1);
-
         let status = &statuses[0];
         assert_eq!(status.state, TaskState::Running);
         match &status.kind {
             crate::task::TaskStatusKind::Timer { label, fires_in } => {
                 assert_eq!(label, "check_build");
-                assert!(*fires_in <= 50, "fires_in should be <= 50, got {}", fires_in);
-                assert!(*fires_in >= 49, "fires_in should be >= 49, got {}", fires_in);
+                assert!(*fires_in <= 50);
+                assert!(*fires_in >= 49);
             }
             other => panic!("Expected timer status, got {:?}", other),
         }
@@ -567,13 +493,13 @@ mod tests {
     #[test]
     fn kill_nonexistent_pid_returns_error() {
         let mut orch = Orchestrator::new();
-        let result = orch.kill(&[999]);
-        assert!(result.is_err());
+        assert!(orch.kill(&[999]).is_err());
     }
 
     #[test]
     fn get_output_returns_none_for_unknown_pid() {
         let orch = Orchestrator::new();
         assert!(orch.get_output(42).is_none());
+        assert!(orch.get_nonce(42).is_none());
     }
 }
