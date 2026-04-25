@@ -35,6 +35,10 @@ pub struct SignalEntry {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub payload: Option<serde_json::Value>,
+    /// Output-provenance nonce (MCP EXIT signals only). Stored for JSON consumers;
+    /// the display format embeds it in the message string instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nonce: Option<String>,
 }
 
 impl fmt::Display for SignalEntry {
@@ -58,6 +62,7 @@ impl SignalEntry {
             kind,
             message: message.into(),
             payload: None,
+            nonce: None,
         }
     }
 
@@ -73,7 +78,14 @@ impl SignalEntry {
             kind,
             message: message.into(),
             payload: Some(payload),
+            nonce: None,
         }
+    }
+
+    /// Attach an output-provenance nonce (for JSON serialization).
+    pub fn with_nonce(mut self, nonce: impl Into<String>) -> Self {
+        self.nonce = Some(nonce.into());
+        self
     }
 }
 
@@ -164,5 +176,24 @@ mod tests {
         assert_eq!(last2.len(), 2);
         assert_eq!(last2[0].pid, 4);
         assert_eq!(last2[1].pid, 5);
+    }
+
+    #[test]
+    fn nonce_stored_on_entry_but_not_in_display() {
+        let entry =
+            SignalEntry::new(7, SignalKind::Exit, "[hash=a3f2c1] 200").with_nonce("a3f2c1");
+        // nonce field is set for JSON consumers
+        assert_eq!(entry.nonce.as_deref(), Some("a3f2c1"));
+        // display shows the message verbatim — hash is already embedded by the orchestrator
+        let s = format!("{}", entry);
+        assert!(s.contains("[hash=a3f2c1]"), "message should contain hash prefix: {}", s);
+        assert!(s.contains("200"), "message should contain status code: {}", s);
+    }
+
+    #[test]
+    fn init_signal_has_no_hash_in_display() {
+        let entry = SignalEntry::new(7, SignalKind::Init, "shellmcp/run_command");
+        let s = format!("{}", entry);
+        assert!(!s.contains("[hash="), "INIT should not contain hash prefix: {}", s);
     }
 }
