@@ -148,6 +148,21 @@ fn tool_definitions() -> Value {
             }
         },
         {
+            "name": "get_output",
+            "description": "Retrieve the full output from one or more successfully completed MCP tasks. Output is suppressed from the signal window on success (shown only as '[hash=xxxx] 200') to save LLM context — use this tool when you need to read the actual result. Failed tasks (500) have no stored output; check the signal log for error details.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pids": {
+                        "type": "array",
+                        "items": { "type": "integer" },
+                        "description": "PIDs of completed tasks to retrieve output for. Multiple PIDs can be fetched in one call."
+                    }
+                },
+                "required": ["pids"]
+            }
+        },
+        {
             "name": "timer",
             "description": "Set a one-shot timer. Fires a REMIND signal after the specified duration, then exits. No MCP server involved — pure delay. Use for goal deferral, scheduled re-checks, or any timed reminder. Killable via the kill tool.",
             "inputSchema": {
@@ -385,6 +400,7 @@ async fn handle_tools_call(
         "wait" => handle_wait(id, arguments, orchestrator).await,
         "status" => handle_status(id, orchestrator).await,
         "log" => handle_log(id, arguments, orchestrator).await,
+        "get_output" => handle_get_output(id, arguments, orchestrator).await,
         "timer" => handle_timer(id, arguments, orchestrator).await,
         "browse_servers" => handle_browse_servers(id, arguments).await,
         "browse_servers_batch" => handle_browse_servers_batch(id, arguments).await,
@@ -570,6 +586,65 @@ async fn handle_log(
                 "text": window_text
             }],
             "entries": window_json
+        }),
+    )
+}
+
+async fn handle_get_output(
+    id: Value,
+    arguments: Value,
+    orchestrator: Arc<Mutex<Orchestrator>>,
+) -> JsonRpcResponse {
+    let pids: Vec<u64> = match arguments.get("pids") {
+        Some(v) => match serde_json::from_value(v.clone()) {
+            Ok(p) => p,
+            Err(e) => {
+                return JsonRpcResponse::error(id, -32602, format!("Invalid pids: {}", e));
+            }
+        },
+        None => return JsonRpcResponse::error(id, -32602, "Missing 'pids' parameter"),
+    };
+
+    if pids.is_empty() {
+        return JsonRpcResponse::error(id, -32602, "Empty pids list");
+    }
+
+    let orch = orchestrator.lock().await;
+    let mut text_parts: Vec<String> = Vec::new();
+    let mut outputs_map = serde_json::Map::new();
+
+    for &pid in &pids {
+        match orch.get_output(pid) {
+            Some(out) => {
+                let header = match orch.get_nonce(pid) {
+                    Some(h) => format!("PID {} [hash={}]", pid, h),
+                    None => format!("PID {}", pid),
+                };
+                text_parts.push(format!("{}
+{}", header, out));
+                outputs_map.insert(
+                    pid.to_string(),
+                    json!({
+                        "hash": orch.get_nonce(pid),
+                        "output": out
+                    }),
+                );
+            }
+            None => {
+                text_parts.push(format!(
+                    "PID {}: no stored output (task failed or PID unknown — check signal log)",
+                    pid
+                ));
+                outputs_map.insert(pid.to_string(), Value::Null);
+            }
+        }
+    }
+
+    JsonRpcResponse::success(
+        id,
+        json!({
+            "content": [{"type": "text", "text": text_parts.join("\n\n---\n\n")}],
+            "outputs": outputs_map
         }),
     )
 }
