@@ -38,10 +38,12 @@ pub struct Orchestrator {
     reminder_rx: mpsc::Receiver<ReminderEvent>,
     task_result_rx: mpsc::Receiver<TaskResult>,
     task_result_tx: mpsc::Sender<TaskResult>,
-    /// Stored output for successfully completed MCP tasks (200 exits).
-    /// Keyed by PID. Suppressed from the signal window to save LLM context;
-    /// retrieve via get_output(pid) / the get_output MCP tool.
+    /// Output store for completed MCP tasks. Always populated regardless of defer_output;
+    /// for non-deferred tasks the same content also appears inline in the EXIT signal.
     outputs: HashMap<u64, String>,
+    /// Current goal strategy set by the LLM via the dispatch tool's `strategy` field.
+    /// Prepended to every LLM wakeup response so the LLM retains goal context across cycles.
+    strategy: Option<String>,
 }
 
 impl Orchestrator {
@@ -56,10 +58,16 @@ impl Orchestrator {
             task_result_rx,
             task_result_tx,
             outputs: HashMap::new(),
+            strategy: None,
         }
     }
 
-    pub fn dispatch(&mut self, task_defs: Vec<TaskDef>) -> Vec<u64> {
+    /// Dispatch a batch of MCP tasks for concurrent execution.
+    /// If `strategy` is provided it replaces the current goal strategy (persists across wakeup cycles).
+    pub fn dispatch(&mut self, task_defs: Vec<TaskDef>, strategy: Option<String>) -> Vec<u64> {
+        if let Some(s) = strategy {
+            self.strategy = Some(s);
+        }
         info!(count = task_defs.len(), "dispatching MCP tasks");
         let mut pids = Vec::with_capacity(task_defs.len());
 
@@ -221,7 +229,9 @@ impl Orchestrator {
         self.tasks.values().map(TaskStatus::from).collect()
     }
 
-    /// Retrieve stored output for a successfully completed MCP task (200 exit).
+    /// Retrieve stored output for a completed MCP task.
+    /// Always available regardless of defer_output — for non-deferred tasks
+    /// the same content is also in the EXIT signal inline.
     pub fn get_output(&self, pid: u64) -> Option<&str> {
         self.outputs.get(&pid).map(|s| s.as_str())
     }
@@ -245,20 +255,33 @@ impl Orchestrator {
             .any(|t| t.state == TaskState::Running)
     }
 
+    /// Format the signal window prepended with the current strategy (if set).
+    fn format_wakeup_context(&self, count: usize) -> String {
+        let window = self.signal_window.format_window(count);
+        match &self.strategy {
+            Some(s) => format!("Current strategy: {s}\n\n{window}"),
+            None => window,
+        }
+    }
+
     pub async fn wait_for_event(&mut self) -> Result<String> {
         if !self.has_running_tasks() {
             debug!("wait_for_event: no running tasks, returning immediately");
-            return Ok(self.signal_window.format_window(DEFAULT_WINDOW_SIZE));
+            return Ok(self.format_wakeup_context(DEFAULT_WINDOW_SIZE));
         }
 
         debug!("wait_for_event: blocking until next event");
         loop {
             tokio::select! {
                 Some(result) = self.task_result_rx.recv() => {
+                    let pid = result.pid;
+                    let fire_wake = self.tasks.get(&pid)
+                        .and_then(|t| if let TaskKind::Mcp(def) = &t.kind { Some(def.fire_wake) } else { None })
+                        .unwrap_or(false);
                     self.handle_task_result(result);
-                    if !self.has_running_tasks() {
-                        debug!("all tasks completed, waking LLM");
-                        return Ok(self.signal_window.format_window(DEFAULT_WINDOW_SIZE));
+                    if !self.has_running_tasks() || fire_wake {
+                        debug!(fire_wake, "waking LLM");
+                        return Ok(self.format_wakeup_context(DEFAULT_WINDOW_SIZE));
                     }
                 }
                 Some(event) = self.reminder_rx.recv() => {
@@ -270,7 +293,7 @@ impl Orchestrator {
                                 SignalKind::Remind,
                                 format!("Running for {}s", event.elapsed_secs),
                             ));
-                            return Ok(self.signal_window.format_window(DEFAULT_WINDOW_SIZE));
+                            return Ok(self.format_wakeup_context(DEFAULT_WINDOW_SIZE));
                         }
                     }
                 }
@@ -298,11 +321,26 @@ impl Orchestrator {
                     Ok(out) => {
                         info!(pid = result.pid, "MCP task completed");
                         let raw = if out.is_empty() { "(no output)".to_string() } else { out };
-                        self.outputs.insert(result.pid, raw);
-                        let message = match task_nonce.as_deref() {
-                            Some(h) => format!("[hash={h}] 200"),
-                            None => "200".to_string(),
+
+                        let defer = self.tasks.get(&result.pid)
+                            .and_then(|t| if let TaskKind::Mcp(def) = &t.kind { Some(def.defer_output) } else { None })
+                            .unwrap_or(false);
+
+                        // Always store so get_output() works in both inline and deferred modes.
+                        self.outputs.insert(result.pid, raw.clone());
+
+                        let message = if defer {
+                            match task_nonce.as_deref() {
+                                Some(h) => format!("[hash={h}] 200 (deferred)"),
+                                None    => "200 (deferred)".to_string(),
+                            }
+                        } else {
+                            match task_nonce.as_deref() {
+                                Some(h) => format!("[hash={h}] 200 <{h}>{raw}</{h}>"),
+                                None    => format!("200 <raw>{raw}</raw>"),
+                            }
                         };
+
                         let entry = SignalEntry::new(result.pid, SignalKind::Exit, message);
                         match task_nonce {
                             Some(h) => entry.with_nonce(h),
@@ -501,5 +539,12 @@ mod tests {
         let orch = Orchestrator::new();
         assert!(orch.get_output(42).is_none());
         assert!(orch.get_nonce(42).is_none());
+    }
+
+    #[test]
+    fn strategy_stored_and_returns_none_initially() {
+        let orch = Orchestrator::new();
+        let context = orch.format_wakeup_context(20);
+        assert!(!context.contains("Current strategy:"));
     }
 }
