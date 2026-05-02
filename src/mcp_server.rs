@@ -74,7 +74,7 @@ fn tool_definitions() -> Value {
     json!([
         {
             "name": "dispatch",
-            "description": "Dispatch a list of tasks for concurrent execution via MCP servers. Each task specifies a server, tool, parameters, and optional reminder interval. Returns immediately with assigned PIDs, then blocks until all tasks complete or a reminder fires — returning the signal window.",
+            "description": "Dispatch a list of tasks for concurrent execution via MCP servers. Each task specifies a server, tool, parameters, and optional settings. Returns immediately with assigned PIDs, then blocks until all tasks complete or a reminder fires — returning the signal window (with strategy prepended if set).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -86,11 +86,23 @@ fn tool_definitions() -> Value {
                                 "server": { "type": "string", "description": "MCP server ID (as known to dmcp)" },
                                 "tool": { "type": "string", "description": "Tool name on the server" },
                                 "params": { "type": "object", "description": "Parameters to pass to the tool" },
-                                "remind_after": { "type": "integer", "description": "Seconds before firing a reminder (omit for no reminder)" }
+                                "remind_after": { "type": "integer", "description": "Seconds before firing a reminder (omit for no reminder)" },
+                                "fire_wake": {
+                                    "type": "boolean",
+                                    "description": "If true, wake the LLM immediately when this task exits, even if other tasks are still running. Default: false (wake only when all tasks are done or a reminder fires)."
+                                },
+                                "defer_output": {
+                                    "type": "boolean",
+                                    "description": "If true, store output out-of-band and show only '[hash=h] 200 (deferred)' in the EXIT signal. Use for large payloads to keep the signal window compact. Default: false (output inlined as '[hash=h] 200 <h>output</h>')."
+                                }
                             },
                             "required": ["server", "tool"]
                         },
                         "description": "List of tasks to dispatch concurrently"
+                    },
+                    "strategy": {
+                        "type": "string",
+                        "description": "Current goal state and workflow plan. Stored in the orchestrator and prepended to every LLM wakeup response for this session. Update it on each dispatch call to keep context across wakeup cycles."
                     }
                 },
                 "required": ["tasks"]
@@ -149,7 +161,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "get_output",
-            "description": "Retrieve the full output from one or more successfully completed MCP tasks. Output is suppressed from the signal window on success (shown only as '[hash=xxxx] 200') to save LLM context — use this tool when you need to read the actual result. Failed tasks (500) have no stored output; check the signal log for error details.",
+            "description": "Retrieve the full output from one or more completed MCP tasks. By default, output is already inlined in the EXIT signal as '[hash=h] 200 <h>output</h>' — use this tool to re-read output, or to retrieve output from tasks that used defer_output: true (those show only '[hash=h] 200 (deferred)' in the signal window). Failed tasks (500) have no stored output; check the signal log for error details.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -441,8 +453,14 @@ async fn handle_dispatch(
         return JsonRpcResponse::error(id, -32602, "Empty task list");
     }
 
-    // Dispatch tasks
-    let pids = orchestrator.lock().await.dispatch(tasks);
+    // Parse optional goal strategy
+    let strategy = arguments
+        .get("strategy")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    // Dispatch tasks (strategy stored in orchestrator if provided)
+    let pids = orchestrator.lock().await.dispatch(tasks, strategy);
 
     // Block until all tasks complete or a reminder fires
     let signal_window = orchestrator.lock().await.wait_for_event().await;
@@ -545,7 +563,7 @@ async fn handle_wait(
                 "waited": pids
             }),
         ),
-        Err(e) => JsonRpcResponse::error(id, -32000, e.to_string()),
+        Err(e) => JsonRpcResponse::error(id, -32000, format!("Dispatch error: {}", e)),
     }
 }
 
@@ -620,8 +638,7 @@ async fn handle_get_output(
                     Some(h) => format!("PID {} [hash={}]", pid, h),
                     None => format!("PID {}", pid),
                 };
-                text_parts.push(format!("{}
-{}", header, out));
+                text_parts.push(format!("{}\n{}", header, out));
                 outputs_map.insert(
                     pid.to_string(),
                     json!({

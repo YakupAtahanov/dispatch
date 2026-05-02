@@ -18,6 +18,13 @@ pub struct TaskDef {
     #[serde(default)]
     pub params: serde_json::Value,
     pub remind_after: Option<u64>,
+    /// Wake the LLM immediately when this task exits, even if other tasks are still running.
+    #[serde(default)]
+    pub fire_wake: bool,
+    /// Store output out-of-band instead of inlining it in the EXIT signal.
+    /// Use for large payloads where inline content would bloat the signal window.
+    #[serde(default)]
+    pub defer_output: bool,
 }
 
 /// A timer definition as received from the LLM.
