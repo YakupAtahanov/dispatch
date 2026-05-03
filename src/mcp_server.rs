@@ -74,7 +74,7 @@ fn tool_definitions() -> Value {
     json!([
         {
             "name": "dispatch",
-            "description": "Dispatch a list of tasks for concurrent execution via MCP servers. Each task specifies a server, tool, parameters, and optional settings. Returns immediately with assigned PIDs, then blocks until all tasks complete or a reminder fires — returning the signal window (with strategy prepended if set).",
+            "description": "Dispatch a list of tasks for concurrent execution via MCP servers. Each task specifies a server, tool, parameters, and optional settings. Blocks until any task signals (EXIT, REMIND, or KILL), then returns the signal window. The LLM receives each task's output as it arrives and can loop back with 'wait' for remaining tasks. Strategy is prepended to every wakeup response if set.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -89,7 +89,7 @@ fn tool_definitions() -> Value {
                                 "remind_after": { "type": "integer", "description": "Seconds before firing a reminder (omit for no reminder)" },
                                 "fire_wake": {
                                     "type": "boolean",
-                                    "description": "If true, wake the LLM immediately when this task exits, even if other tasks are still running. Default: false (wake only when all tasks are done or a reminder fires)."
+                                    "description": "Default: true. Set to false for fire-and-forget background tasks — suppresses per-task wakeup so the LLM is only woken when all fire_wake=false tasks complete together or a reminder fires."
                                 },
                                 "defer_output": {
                                     "type": "boolean",
@@ -462,7 +462,7 @@ async fn handle_dispatch(
     // Dispatch tasks (strategy stored in orchestrator if provided)
     let pids = orchestrator.lock().await.dispatch(tasks, strategy);
 
-    // Block until all tasks complete or a reminder fires
+    // Block until any task signals
     let signal_window = orchestrator.lock().await.wait_for_event().await;
 
     match signal_window {
@@ -638,7 +638,8 @@ async fn handle_get_output(
                     Some(h) => format!("PID {} [hash={}]", pid, h),
                     None => format!("PID {}", pid),
                 };
-                text_parts.push(format!("{}\n{}", header, out));
+                text_parts.push(format!("{}
+{}", header, out));
                 outputs_map.insert(
                     pid.to_string(),
                     json!({

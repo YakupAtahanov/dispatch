@@ -10,6 +10,10 @@ pub enum TaskState {
     Killed,
 }
 
+fn default_fire_wake() -> bool {
+    true
+}
+
 /// A task definition as received from the LLM (MCP server call).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskDef {
@@ -18,8 +22,11 @@ pub struct TaskDef {
     #[serde(default)]
     pub params: serde_json::Value,
     pub remind_after: Option<u64>,
-    /// Wake the LLM immediately when this task exits, even if other tasks are still running.
-    #[serde(default)]
+    /// Wake the LLM when this task exits, even if other tasks are still running.
+    /// Default: true. Set to false for fire-and-forget background tasks where
+    /// you don't need per-task wakeups — the LLM will only be woken when all
+    /// fire_wake=false tasks finish together or a reminder fires.
+    #[serde(default = "default_fire_wake")]
     pub fire_wake: bool,
     /// Store output out-of-band instead of inlining it in the EXIT signal.
     /// Use for large payloads where inline content would bloat the signal window.
