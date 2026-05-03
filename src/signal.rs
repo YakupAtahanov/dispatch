@@ -1,6 +1,6 @@
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fmt;
 
 /// The type of signal emitted by the system.
@@ -134,6 +134,25 @@ impl SignalWindow {
         out
     }
 
+    /// Format only entries whose PID is in the given set.
+    /// Used for session-scoped signal windows so historical PIDs from
+    /// earlier goals never appear in the LLM's context.
+    pub fn format_window_for_pids(&self, count: usize, pids: &HashSet<u64>) -> String {
+        let filtered: Vec<&SignalEntry> = self.entries.iter()
+            .filter(|e| pids.contains(&e.pid))
+            .collect();
+        if filtered.is_empty() {
+            return "Signal window: (empty)".to_string();
+        }
+        let take_from = filtered.len().saturating_sub(count);
+        let entries = &filtered[take_from..];
+        let mut out = format!("Signal window (last {}):\n", entries.len());
+        for entry in entries {
+            out.push_str(&format!("{}\n", entry));
+        }
+        out
+    }
+
     /// Serialize the window entries as JSON.
     pub fn to_json(&self, count: usize) -> serde_json::Value {
         let entries = self.last(count);
@@ -179,12 +198,26 @@ mod tests {
     }
 
     #[test]
+    fn format_window_for_pids_filters_correctly() {
+        let mut window = SignalWindow::new(20);
+        window.push(SignalEntry::new(1, SignalKind::Init, "old task"));
+        window.push(SignalEntry::new(1, SignalKind::Exit, "old result"));
+        window.push(SignalEntry::new(2, SignalKind::Init, "current task"));
+        window.push(SignalEntry::new(2, SignalKind::Remind, "running"));
+
+        let mut pids = HashSet::new();
+        pids.insert(2u64);
+        let text = window.format_window_for_pids(20, &pids);
+
+        assert!(text.contains("PID 2"), "should show current PID");
+        assert!(!text.contains("PID 1"), "should not show old PID");
+    }
+
+    #[test]
     fn nonce_stored_on_entry_but_not_in_display() {
         let entry =
             SignalEntry::new(7, SignalKind::Exit, "[hash=a3f2c1] 200").with_nonce("a3f2c1");
-        // nonce field is set for JSON consumers
         assert_eq!(entry.nonce.as_deref(), Some("a3f2c1"));
-        // display shows the message verbatim — hash is already embedded by the orchestrator
         let s = format!("{}", entry);
         assert!(s.contains("[hash=a3f2c1]"), "message should contain hash prefix: {}", s);
         assert!(s.contains("200"), "message should contain status code: {}", s);
