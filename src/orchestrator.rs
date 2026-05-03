@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::json;
 use tokio::sync::mpsc;
@@ -38,12 +38,16 @@ pub struct Orchestrator {
     reminder_rx: mpsc::Receiver<ReminderEvent>,
     task_result_rx: mpsc::Receiver<TaskResult>,
     task_result_tx: mpsc::Sender<TaskResult>,
-    /// Output store for completed MCP tasks. Always populated regardless of defer_output;
-    /// for non-deferred tasks the same content also appears inline in the EXIT signal.
+    /// Output store for completed MCP tasks.
     outputs: HashMap<u64, String>,
     /// Current goal strategy set by the LLM via the dispatch tool's `strategy` field.
-    /// Prepended to every LLM wakeup response so the LLM retains goal context across cycles.
     strategy: Option<String>,
+    /// Maps each dispatched PID to the session_id it belongs to.
+    /// Used to scope signal window output per goal/session.
+    pid_to_session: HashMap<u64, String>,
+    /// The session_id from the most recent dispatch call.
+    /// format_wakeup_context() filters the window to this session when set.
+    current_session_id: Option<String>,
 }
 
 impl Orchestrator {
@@ -59,14 +63,26 @@ impl Orchestrator {
             task_result_tx,
             outputs: HashMap::new(),
             strategy: None,
+            pid_to_session: HashMap::new(),
+            current_session_id: None,
         }
     }
 
     /// Dispatch a batch of MCP tasks for concurrent execution.
-    /// If `strategy` is provided it replaces the current goal strategy (persists across wakeup cycles).
-    pub fn dispatch(&mut self, task_defs: Vec<TaskDef>, strategy: Option<String>) -> Vec<u64> {
+    /// `strategy` replaces the current goal strategy if provided.
+    /// `session_id` scopes the signal window for this batch — only PIDs
+    /// belonging to this session appear in wakeup responses.
+    pub fn dispatch(
+        &mut self,
+        task_defs: Vec<TaskDef>,
+        strategy: Option<String>,
+        session_id: Option<String>,
+    ) -> Vec<u64> {
         if let Some(s) = strategy {
             self.strategy = Some(s);
+        }
+        if session_id.is_some() {
+            self.current_session_id = session_id.clone();
         }
         info!(count = task_defs.len(), "dispatching MCP tasks");
         let mut pids = Vec::with_capacity(task_defs.len());
@@ -77,7 +93,10 @@ impl Orchestrator {
             let mut task = Task::new_mcp(task_pid, def);
             debug!(pid = task_pid, desc = %task.description(), "spawning MCP task");
 
-            // INIT signal carries no hash — nonce is internal until EXIT
+            if let Some(ref sid) = session_id {
+                self.pid_to_session.insert(task_pid, sid.clone());
+            }
+
             self.signal_window.push(SignalEntry::new(
                 task_pid,
                 SignalKind::Init,
@@ -229,14 +248,10 @@ impl Orchestrator {
         self.tasks.values().map(TaskStatus::from).collect()
     }
 
-    /// Retrieve stored output for a completed MCP task.
-    /// Always available regardless of defer_output — for non-deferred tasks
-    /// the same content is also in the EXIT signal inline.
     pub fn get_output(&self, pid: u64) -> Option<&str> {
         self.outputs.get(&pid).map(|s| s.as_str())
     }
 
-    /// Retrieve the provenance nonce for a task (MCP tasks only).
     pub fn get_nonce(&self, pid: u64) -> Option<&str> {
         self.tasks.get(&pid).and_then(|t| t.nonce.as_deref())
     }
@@ -255,9 +270,30 @@ impl Orchestrator {
             .any(|t| t.state == TaskState::Running)
     }
 
+    /// All PIDs belonging to a given session.
+    fn session_pids(&self, session_id: &str) -> HashSet<u64> {
+        self.pid_to_session
+            .iter()
+            .filter(|(_, sid)| sid.as_str() == session_id)
+            .map(|(pid, _)| *pid)
+            .collect()
+    }
+
     /// Format the signal window prepended with the current strategy (if set).
+    /// When current_session_id is set, the window is filtered to only show
+    /// entries for PIDs belonging to that session.
     fn format_wakeup_context(&self, count: usize) -> String {
-        let window = self.signal_window.format_window(count);
+        let window = match self.current_session_id.as_deref() {
+            None => self.signal_window.format_window(count),
+            Some(sid) => {
+                let pids = self.session_pids(sid);
+                if pids.is_empty() {
+                    self.signal_window.format_window(count)
+                } else {
+                    self.signal_window.format_window_for_pids(count, &pids)
+                }
+            }
+        };
         match &self.strategy {
             Some(s) => format!("Current strategy: {s}\n\n{window}"),
             None => window,
@@ -326,7 +362,6 @@ impl Orchestrator {
                             .and_then(|t| if let TaskKind::Mcp(def) = &t.kind { Some(def.defer_output) } else { None })
                             .unwrap_or(false);
 
-                        // Always store so get_output() works in both inline and deferred modes.
                         self.outputs.insert(result.pid, raw.clone());
 
                         let message = if defer {
@@ -546,5 +581,20 @@ mod tests {
         let orch = Orchestrator::new();
         let context = orch.format_wakeup_context(20);
         assert!(!context.contains("Current strategy:"));
+    }
+
+    #[test]
+    fn session_pids_returns_only_matching_pids() {
+        let mut orch = Orchestrator::new();
+        orch.pid_to_session.insert(1, "goal_a".to_string());
+        orch.pid_to_session.insert(2, "goal_a".to_string());
+        orch.pid_to_session.insert(3, "goal_b".to_string());
+        let pids_a = orch.session_pids("goal_a");
+        assert!(pids_a.contains(&1));
+        assert!(pids_a.contains(&2));
+        assert!(!pids_a.contains(&3));
+        let pids_b = orch.session_pids("goal_b");
+        assert!(pids_b.contains(&3));
+        assert!(!pids_b.contains(&1));
     }
 }

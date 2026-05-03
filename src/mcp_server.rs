@@ -103,6 +103,10 @@ fn tool_definitions() -> Value {
                     "strategy": {
                         "type": "string",
                         "description": "Current goal state and workflow plan. Stored in the orchestrator and prepended to every LLM wakeup response for this session. Update it on each dispatch call to keep context across wakeup cycles."
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Optional session identifier (e.g. the goal ID from the orchestrating LLM). When provided, the signal window returned on each wakeup is filtered to only show signals for PIDs belonging to this session — preventing historical entries from earlier goals from polluting the LLM context."
                     }
                 },
                 "required": ["tasks"]
@@ -324,7 +328,7 @@ pub async fn serve() -> io::Result<()> {
             }
         };
 
-        let _ = &request.jsonrpc; // acknowledge field
+        let _ = &request.jsonrpc;
 
         let id = request.id.clone().unwrap_or(Value::Null);
         debug!(method = %request.method, "received JSON-RPC request");
@@ -349,7 +353,6 @@ pub async fn serve() -> io::Result<()> {
             "ping" => JsonRpcResponse::success(id, json!({})),
 
             _ => {
-                // For notifications (no id), silently ignore
                 if request.id.is_none() {
                     continue;
                 }
@@ -361,7 +364,6 @@ pub async fn serve() -> io::Result<()> {
         write_response(&mut stdout, &response).await?;
     }
 
-    // Client disconnected — clean up
     orchestrator.lock().await.shutdown();
     Ok(())
 }
@@ -432,7 +434,6 @@ async fn handle_dispatch(
     arguments: Value,
     orchestrator: Arc<Mutex<Orchestrator>>,
 ) -> JsonRpcResponse {
-    // Parse task definitions
     let tasks: Vec<TaskDef> = match arguments.get("tasks") {
         Some(tasks_val) => match serde_json::from_value(tasks_val.clone()) {
             Ok(t) => t,
@@ -453,16 +454,18 @@ async fn handle_dispatch(
         return JsonRpcResponse::error(id, -32602, "Empty task list");
     }
 
-    // Parse optional goal strategy
     let strategy = arguments
         .get("strategy")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    // Dispatch tasks (strategy stored in orchestrator if provided)
-    let pids = orchestrator.lock().await.dispatch(tasks, strategy);
+    let session_id = arguments
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
-    // Block until any task signals
+    let pids = orchestrator.lock().await.dispatch(tasks, strategy, session_id);
+
     let signal_window = orchestrator.lock().await.wait_for_event().await;
 
     match signal_window {
@@ -541,7 +544,6 @@ async fn handle_wait(
         }
     };
 
-    // Record WAIT signals
     {
         let mut orch = orchestrator.lock().await;
         if let Err(e) = orch.wait(&pids) {
@@ -549,7 +551,6 @@ async fn handle_wait(
         }
     }
 
-    // Block until next event
     let signal_window = orchestrator.lock().await.wait_for_event().await;
 
     match signal_window {
@@ -638,8 +639,7 @@ async fn handle_get_output(
                     Some(h) => format!("PID {} [hash={}]", pid, h),
                     None => format!("PID {}", pid),
                 };
-                text_parts.push(format!("{}
-{}", header, out));
+                text_parts.push(format!("{}\n{}", header, out));
                 outputs_map.insert(
                     pid.to_string(),
                     json!({
@@ -696,7 +696,6 @@ async fn handle_timer(
 
     let pid = orchestrator.lock().await.dispatch_timer(def);
 
-    // Block until the timer fires (or gets killed)
     let signal_window = orchestrator.lock().await.wait_for_event().await;
 
     match signal_window {
