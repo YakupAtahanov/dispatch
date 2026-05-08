@@ -24,3 +24,7 @@ target
 # Added by cargo
 
 /target
+
+# makepkg artifacts
+dispatch-mcp-git/
+src/
